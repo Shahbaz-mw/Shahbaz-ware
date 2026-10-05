@@ -1,0 +1,134 @@
+services:
+
+  # ============================================================
+  # Identity Service
+  # Internal port: 8080
+  # Public route: http://202.66.173.124:8080/identity/
+  # ============================================================
+  identityservice:
+    # Jenkins loads pcts2/identityservice:<BUILD_NUMBER>
+    # Example: pcts2/identityservice:48
+    image: pcts2/identityservice:${IMAGE_TAG:-latest}
+    container_name: pcts-identityservice
+    restart: unless-stopped
+
+    # Do NOT publish 8080 to the host.
+    # Nginx gateway accesses this container over pcts-net.
+    expose:
+      - "8080"
+
+    volumes:
+      - /opt/pcts2/uploads/images:/app/uploads/images
+
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+
+      # Storage
+      Storage__UploadsPath: "uploads/images"
+      Storage__PublicPath: "/images"
+      ImageStorage__Path: "/app/uploads/images"
+      ImageStorage__Url: "/images"
+
+      # Identity Database
+      ConnectionStrings__PctsLogin: "Server=103.48.51.57,${SQLSERVER_PORT:-1433};Database=PctsLogin;User Id=${SQLSERVER_USER};Password=${SQLSERVER_PASSWORD};TrustServerCertificate=True;"
+
+      # JWT
+      Jwt__Key: "${JWT_SIGNING_KEY}"
+      Jwt__Issuer: "PCTS2.IdentityService"
+      Jwt__Audience: "PCTS2.Clients"
+      Jwt__AccessTokenMinutes: "15"
+      Jwt__RefreshTokenDays: "7"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - pcts-net
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:8080/health/live"
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # ============================================================
+  # Master Service
+  # Internal port: 8080
+  # Public route: http://202.66.173.124:8080/master/
+  # ============================================================
+  master:
+    image: pcts2/master:${IMAGE_TAG:-latest}
+    container_name: pcts-master
+    restart: unless-stopped
+
+    expose:
+      - "8080"
+
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+
+      # Master Database
+      ConnectionStrings__PctsMaster: "Server=103.48.51.57,${SQLSERVER_PORT:-1433};Database=PctsMaster;User Id=${SQLSERVER_USER};Password=${SQLSERVER_PASSWORD};TrustServerCertificate=True;"
+
+      # JWT
+      JwtSettings__SecretKey: "${JWT_SIGNING_KEY}"
+      JwtSettings__Issuer: "PCTS2.IdentityService"
+      JwtSettings__Audience: "PCTS2.Clients"
+
+    networks:
+      - pcts-net
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:8080/health/live"
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # ============================================================
+  # Backend Nginx Gateway
+  #
+  # ONLY backend container publishing host port 8080.
+  #
+  # /identity/* --> Identity Service :8080
+  # /master/*   --> Master Service   :8080
+  # ============================================================
+  backend-gateway:
+    image: nginx:alpine
+    container_name: pcts-backend-gateway
+    restart: unless-stopped
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      - ./nginx-backend.conf:/etc/nginx/conf.d/default.conf:ro
+
+    depends_on:
+      identityservice:
+        condition: service_healthy
+      master:
+        condition: service_healthy
+
+    networks:
+      - pcts-net
+
+  # ============================================================
+  # Docker Network
+  # ============================================================
+networks:
+  pcts-net:
+    driver: bridge
