@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1
+
+# ---- Build stage ----
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+
+# Central Build/Package management files must be present before restore.
+COPY ["Directory.Build.props", "Directory.Packages.props", "./"]
+
+# Copy project files first for Docker layer caching.
+COPY ["src/BuildingBlocks/BuildingBlocks.Common/BuildingBlocks.Common.csproj", "src/BuildingBlocks/BuildingBlocks.Common/"]
+
+COPY ["src/Services/Identity/src/IdentityService.Api/IdentityService.Api.csproj", "src/Services/Identity/src/IdentityService.Api/"]
+
+COPY ["src/Services/Identity/src/IdentityService.Application/IdentityService.Application.csproj", "src/Services/Identity/src/IdentityService.Application/"]
+
+COPY ["src/Services/Identity/src/IdentityService.Infrastructure.Data/IdentityService.Infrastructure.Data.csproj", "src/Services/Identity/src/IdentityService.Infrastructure.Data/"]
+
+COPY ["src/Services/Identity/src/IdentityService.Domain/IdentityService.Domain.csproj", "src/Services/Identity/src/IdentityService.Domain/"]
+
+# Restore dependencies.
+RUN dotnet restore "src/Services/Identity/src/IdentityService.Api/IdentityService.Api.csproj"
+
+# Copy remaining source code.
+COPY . .
+
+WORKDIR /src/src/Services/Identity/src/IdentityService.Api
+
+# Publish application.
+RUN dotnet publish "IdentityService.Api.csproj" \
+    -c Release \
+    -o /app/publish \
+    --no-restore
+
+
+# ---- Runtime stage ----
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
+
+WORKDIR /app
+
+# Install curl for Docker health check.
+#
+# IdentityService creates RSA signing keys under /app/Keys.
+# The application runs as the non-root "app" user, therefore
+# /app/Keys must be created and owned by that user before startup.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app/Keys \
+    && chown -R app:app /app
+
+# Copy published application and ensure ownership belongs to app user.
+COPY --from=build --chown=app:app /app/publish .
+
+# Run application as non-root user.
+USER app
+
+ENV ASPNETCORE_URLS=http://+:8080 \
+    ASPNETCORE_HTTP_PORTS=8080 \
+    DOTNET_RUNNING_IN_CONTAINER=true
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s \
+    --timeout=5s \
+    --start-period=15s \
+    --retries=3 \
+    CMD curl -f http://localhost:8080/health/live || exit 1
+
+ENTRYPOINT ["dotnet", "IdentityService.Api.dll"]
