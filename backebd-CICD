@@ -1,0 +1,228 @@
+pipeline {
+    agent any
+
+    environment {
+
+        // ==============================
+        // Identity Service
+        // ==============================
+        IDENTITY_IMAGE_NAME = "pcts2/identityservice"
+        IDENTITY_ARTIFACT_NAME = "identityservice-${BUILD_NUMBER}.tar"
+
+        // ==============================
+        // Master Service
+        // ==============================
+        MASTER_IMAGE_NAME = "pcts2/master"
+        MASTER_ARTIFACT_NAME = "master-${BUILD_NUMBER}.tar"
+
+        // ==============================
+        // Application Server
+        // ==============================
+        APP_SERVER = "root@202.66.173.124"
+        DEPLOY_DIR = "/root/deployments"
+
+        DEPLOY_SCRIPT = "/root/deploy-backend-sa.sh"
+
+        // ==============================
+        // Git
+        // ==============================
+        GIT_REPO = "https://github.com/jia-platforms/PCTS2.0-Backend.git"
+        GIT_BRANCH = "staging"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git(
+                    branch: "${GIT_BRANCH}",
+                    credentialsId: 'github-pcts-backend',
+                    url: "${GIT_REPO}"
+                )
+            }
+        }
+
+        stage('Build Identity Image') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "========================================"
+                    echo " Building Identity Docker Image"
+                    echo "========================================"
+
+                    docker build \
+                        -t ${IDENTITY_IMAGE_NAME}:${BUILD_NUMBER} \
+                        -f src/Services/Identity/Dockerfile .
+
+                    echo ""
+                    echo "Identity image:"
+                    docker images ${IDENTITY_IMAGE_NAME}
+                '''
+            }
+        }
+
+        stage('Build Master Image') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "========================================"
+                    echo " Building Master Docker Image"
+                    echo "========================================"
+
+                    docker build \
+                        -t ${MASTER_IMAGE_NAME}:${BUILD_NUMBER} \
+                        -f src/Services/Master/Dockerfile .
+
+                    echo ""
+                    echo "Master image:"
+                    docker images ${MASTER_IMAGE_NAME}
+                '''
+            }
+        }
+
+        stage('Create Identity Artifact') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "========================================"
+                    echo " Creating Identity Artifact"
+                    echo "========================================"
+
+                    rm -f ${IDENTITY_ARTIFACT_NAME}
+
+                    docker save \
+                        -o ${IDENTITY_ARTIFACT_NAME} \
+                        ${IDENTITY_IMAGE_NAME}:${BUILD_NUMBER}
+
+                    ls -lh ${IDENTITY_ARTIFACT_NAME}
+                '''
+            }
+        }
+
+        stage('Create Master Artifact') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "========================================"
+                    echo " Creating Master Artifact"
+                    echo "========================================"
+
+                    rm -f ${MASTER_ARTIFACT_NAME}
+
+                    docker save \
+                        -o ${MASTER_ARTIFACT_NAME} \
+                        ${MASTER_IMAGE_NAME}:${BUILD_NUMBER}
+
+                    ls -lh ${MASTER_ARTIFACT_NAME}
+                '''
+            }
+        }
+
+        stage('Archive Artifacts') {
+            steps {
+                archiveArtifacts(
+                    artifacts: 'identityservice-*.tar,master-*.tar',
+                    fingerprint: true
+                )
+            }
+        }
+
+        stage('Approval for Deployment') {
+            steps {
+                input(
+                    message: "Approve deployment of Identity + Master build ${BUILD_NUMBER} to Production?",
+                    ok: "Approve Deployment"
+                )
+            }
+        }
+
+        stage('Copy Both Artifacts to Application Server') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "========================================"
+                    echo " Copying Identity Artifact"
+                    echo "========================================"
+
+                    scp ${IDENTITY_ARTIFACT_NAME} \
+                        ${APP_SERVER}:${DEPLOY_DIR}/
+
+                    echo "Identity artifact copied successfully."
+
+                    echo ""
+                    echo "========================================"
+                    echo " Copying Master Artifact"
+                    echo "========================================"
+
+                    scp ${MASTER_ARTIFACT_NAME} \
+                        ${APP_SERVER}:${DEPLOY_DIR}/
+
+                    echo "Master artifact copied successfully."
+
+                    echo ""
+                    echo "========================================"
+                    echo " Both Artifacts Copied"
+                    echo "========================================"
+                '''
+            }
+        }
+
+        stage('Deploy Backend') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "========================================"
+                    echo " Deploying Backend"
+                    echo "========================================"
+
+                    ssh ${APP_SERVER} \
+                        "${DEPLOY_SCRIPT} ${BUILD_NUMBER}"
+                '''
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo "========================================"
+            echo " BACKEND DEPLOYMENT SUCCESSFUL"
+            echo "========================================"
+
+            echo "Build Number      : ${BUILD_NUMBER}"
+
+            echo "Identity Image    : ${IDENTITY_IMAGE_NAME}:${BUILD_NUMBER}"
+            echo "Identity Artifact : ${IDENTITY_ARTIFACT_NAME}"
+
+            echo "Master Image      : ${MASTER_IMAGE_NAME}:${BUILD_NUMBER}"
+            echo "Master Artifact   : ${MASTER_ARTIFACT_NAME}"
+        }
+
+        failure {
+            echo "========================================"
+            echo " BACKEND DEPLOYMENT FAILED"
+            echo "========================================"
+
+            echo "Build Number : ${BUILD_NUMBER}"
+
+            echo ""
+            echo "Manual rollback:"
+            echo "/root/rollback-backend.sh <OLD_BUILD_NUMBER>"
+        }
+
+        always {
+            sh '''
+                echo "Cleaning Jenkins workspace Docker artifacts..."
+
+                rm -f identityservice-*.tar || true
+                rm -f master-*.tar || true
+            '''
+        }
+    }
+}
