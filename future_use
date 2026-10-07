@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1
+
+# ---- Build stage ----
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+
+WORKDIR /src
+
+# Central Build/Package management files
+COPY ["Directory.Build.props", "Directory.Packages.props", "./"]
+
+# Copy project files first for better Docker layer caching
+COPY ["src/BuildingBlocks/BuildingBlocks.Common/BuildingBlocks.Common.csproj", "src/BuildingBlocks/BuildingBlocks.Common/"]
+
+COPY ["src/Services/Identity/src/IdentityService.Api/IdentityService.Api.csproj", "src/Services/Identity/src/IdentityService.Api/"]
+
+COPY ["src/Services/Identity/src/IdentityService.Application/IdentityService.Application.csproj", "src/Services/Identity/src/IdentityService.Application/"]
+
+COPY ["src/Services/Identity/src/IdentityService.Infrastructure.Data/IdentityService.Infrastructure.Data.csproj", "src/Services/Identity/src/IdentityService.Infrastructure.Data/"]
+
+COPY ["src/Services/Identity/src/IdentityService.Domain/IdentityService.Domain.csproj", "src/Services/Identity/src/IdentityService.Domain/"]
+
+# Restore dependencies
+RUN dotnet restore "src/Services/Identity/src/IdentityService.Api/IdentityService.Api.csproj"
+
+# Copy remaining source code
+COPY . .
+
+# Publish application
+WORKDIR /src/src/Services/Identity/src/IdentityService.Api
+
+RUN dotnet publish "IdentityService.Api.csproj" \
+    -c Release \
+    -o /app/publish \
+    --no-restore
+
+
+# ---- Runtime stage ----
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
+
+WORKDIR /app
+
+# Install runtime dependencies:
+# - curl: required for container health check
+# - fontconfig: required for font discovery
+# - fonts-dejavu-core: provides usable system fonts for SkiaSharp
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        fontconfig \
+        fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app/Keys \
+    && chown app:app /app/Keys
+
+# Copy published application
+COPY --from=build --chown=app:app /app/publish .
+
+# ASP.NET configuration
+ENV ASPNETCORE_URLS=http://+:8080 \
+    ASPNETCORE_HTTP_PORTS=8080 \
+    DOTNET_RUNNING_IN_CONTAINER=true
+
+EXPOSE 8080
+
+# Run application as non-root user
+USER app
+
+# Container health check
+HEALTHCHECK --interval=30s \
+    --timeout=5s \
+    --start-period=15s \
+    --retries=3 \
+    CMD curl -f http://localhost:8080/health/live || exit 1
+
+# Application startup
+ENTRYPOINT ["dotnet", "IdentityService.Api.dll"]
