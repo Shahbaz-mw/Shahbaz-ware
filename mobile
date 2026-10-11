@@ -1,0 +1,162 @@
+trigger: none   # run manually
+
+pool:
+  name: 'Default'
+
+variables:
+  FLUTTER_VERSION: '3.35.7'   # Dart 3.9 (needed by sqflite_common_ffi) but older than 3.47, where IconData became final; ideally match your devs' local version
+  # Dedicated pub cache for this pipeline/Flutter version (the shared NetworkService cache looks stale/mixed)
+  PUB_CACHE: '$(Agent.ToolsDirectory)\pub_cache_$(FLUTTER_VERSION)'
+  FLUTTER_ROOT_DIR: '$(Agent.ToolsDirectory)\flutter_$(FLUTTER_VERSION)'
+  FLUTTER_DIR: '$(Agent.ToolsDirectory)\flutter_$(FLUTTER_VERSION)\flutter'
+  FLUTTER: '$(Agent.ToolsDirectory)\flutter_$(FLUTTER_VERSION)\flutter\bin\flutter.bat'
+  FLAVOR: 'servertest'
+  APP_DIR: 'MobileApp/health_worker'
+
+steps:
+# This TFS only supports 'self' and 'none', so clone mobile_dev manually
+- checkout: none
+
+- powershell: |
+    # Make sure git is on PATH (look in common install locations)
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+      $found = $false
+      foreach ($c in @("C:\Program Files\Git\cmd", "C:\Program Files (x86)\Git\cmd", "$env:LOCALAPPDATA\Programs\Git\cmd")) {
+        if (Test-Path "$c\git.exe") {
+          $env:PATH = "$c;$env:PATH"
+          Write-Host "##vso[task.prependpath]$c"
+          $found = $true
+          break
+        }
+      }
+      if (-not $found) {
+        # Git not installed: download portable MinGit (no admin rights needed)
+        $gitDir = Join-Path "$(Agent.ToolsDirectory)" "mingit"
+        if (-not (Test-Path "$gitDir\cmd\git.exe")) {
+          Write-Host "Git not found. Downloading portable MinGit..."
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $zip = Join-Path $env:AGENT_TEMPDIRECTORY "mingit.zip"
+          Invoke-WebRequest "https://github.com/git-for-windows/git/releases/download/v2.45.2.windows.1/MinGit-2.45.2-64-bit.zip" -OutFile $zip
+          New-Item -ItemType Directory -Force -Path $gitDir | Out-Null
+          Expand-Archive $zip -DestinationPath $gitDir -Force
+          Remove-Item $zip
+        }
+        $env:PATH = "$gitDir\cmd;$env:PATH"
+        Write-Host "##vso[task.prependpath]$gitDir\cmd"
+      }
+    }
+    git --version
+
+    $dest = "$(Build.SourcesDirectory)"
+    $empty = Join-Path $env:AGENT_TEMPDIRECTORY "empty_dir"
+    New-Item -ItemType Directory -Force -Path $empty | Out-Null
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+    # Empty the sources folder (robocopy handles symlinks/junctions)
+    robocopy $empty $dest /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { Write-Error "Cleanup failed ($LASTEXITCODE)"; exit 1 }
+
+    git -c http.extraheader="AUTHORIZATION: bearer $env:SYSTEM_ACCESSTOKEN" clone --depth 1 --branch SHV3MultiToolTestServer https://wau-tfs1.tgi.local/tfs/TGI/SHv3/_git/mobile_dev $dest
+    if ($LASTEXITCODE -ne 0) { exit 1 }
+  displayName: 'Clone mobile_dev'
+  workingDirectory: $(Agent.TempDirectory)
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+- powershell: |
+    $ProgressPreference = 'SilentlyContinue'   # progress bar makes download/unzip extremely slow in PS 5.1
+    $dir = "$(FLUTTER_DIR)"
+    if (-not (Test-Path "$dir\bin\flutter.bat")) {
+      $zip = Join-Path $env:AGENT_TEMPDIRECTORY "flutter_$(FLUTTER_VERSION).zip"
+      Write-Host "Downloading Flutter $(FLUTTER_VERSION)..."
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      Invoke-WebRequest "https://storage.googleapis.com/flutter_infra_release/releases/stable/windows/flutter_windows_$(FLUTTER_VERSION)-stable.zip" -OutFile $zip
+      New-Item -ItemType Directory -Force -Path "$(FLUTTER_ROOT_DIR)" | Out-Null
+      Expand-Archive $zip -DestinationPath "$(FLUTTER_ROOT_DIR)" -Force
+      Remove-Item $zip
+    } else {
+      Write-Host "Flutter $(FLUTTER_VERSION) already installed"
+    }
+    git config --global --add safe.directory '*'
+    & "$dir\bin\flutter.bat" config --android-sdk "C:\Android\SDK" --no-analytics
+    & "$dir\bin\flutter.bat" --version
+  displayName: 'Install Flutter $(FLUTTER_VERSION)'
+
+# Keystore must exist at MobileApp/health_worker/android/app/upload-keystore.jks
+# (key.properties points to ../app/upload-keystore.jks). Upload it under
+# Pipelines > Library > Secure files, then uncomment:
+# - task: DownloadSecureFile@1
+#   name: keystore
+#   inputs:
+#     secureFile: upload-keystore.jks
+# - powershell: Copy-Item "$(keystore.secureFilePath)" "$(Build.SourcesDirectory)\$(APP_DIR)\android\app\upload-keystore.jks"
+#   displayName: 'Copy keystore'
+
+- powershell: |
+    @"
+    storePassword=$env:KS_PASS
+    keyPassword=$env:KS_PASS
+    keyAlias=upload
+    storeFile=../app/upload-keystore.jks
+    "@ | Set-Content "$(Build.SourcesDirectory)\$(APP_DIR)\android\key.properties"
+  displayName: 'Create key.properties'
+  env:
+    KS_PASS: $(keystorePassword)
+
+- script: '"$(FLUTTER)" pub get'
+  workingDirectory: $(APP_DIR)
+  displayName: 'flutter pub get (installs pubspec packages)'
+
+- powershell: |
+    $ProgressPreference = 'SilentlyContinue'
+    $patterns = @(
+      "C:\Program Files\Java\*",
+      "C:\Program Files\Eclipse Adoptium\*",
+      "C:\Program Files\Microsoft\jdk-*",
+      "C:\Program Files\Zulu\*",
+      "C:\Program Files\Android\Android Studio\jbr",
+      "C:\Program Files\Android\Android Studio\jre",
+      "$(Agent.ToolsDirectory)\jdk17\*"
+    )
+    $best = $null
+    foreach ($pat in $patterns) {
+      foreach ($d in @(Get-Item $pat -ErrorAction SilentlyContinue)) {
+        $root = $d.FullName
+        if (-not (Test-Path "$root\bin\java.exe")) { continue }
+        if (-not (Test-Path "$root\release")) { continue }
+        $m = Select-String -Path "$root\release" -Pattern 'JAVA_VERSION="(\d+)' | Select-Object -First 1
+        if ($m -and [int]$m.Matches[0].Groups[1].Value -ge 17) { $best = $root; break }
+      }
+      if ($best) { break }
+    }
+    if (-not $best) {
+      Write-Host "No JDK 17+ found. Downloading portable Temurin 17..."
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      $jdkRoot = Join-Path "$(Agent.ToolsDirectory)" "jdk17"
+      $zip = Join-Path $env:AGENT_TEMPDIRECTORY "jdk17.zip"
+      Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile $zip
+      New-Item -ItemType Directory -Force -Path $jdkRoot | Out-Null
+      Expand-Archive $zip -DestinationPath $jdkRoot -Force
+      Remove-Item $zip
+      $best = (Get-ChildItem $jdkRoot -Directory | Select-Object -First 1).FullName
+    }
+    Write-Host "Using JDK: $best"
+    Write-Host "##vso[task.setvariable variable=JDK_HOME_RESOLVED]$best"
+  displayName: 'Find or install JDK 17+'
+
+- script: '"$(FLUTTER)" build apk --release --flavor $(FLAVOR)'
+  workingDirectory: $(APP_DIR)
+  displayName: 'Build APK'
+  env:
+    JAVA_HOME: '$(JDK_HOME_RESOLVED)'
+
+- task: CopyFiles@2
+  inputs:
+    sourceFolder: '$(Build.SourcesDirectory)/$(APP_DIR)/build/app/outputs'
+    contents: '**/*.apk'
+    targetFolder: '$(Build.ArtifactStagingDirectory)'
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    pathToPublish: '$(Build.ArtifactStagingDirectory)'
+    artifactName: 'apk'
