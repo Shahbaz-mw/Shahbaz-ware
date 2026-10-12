@@ -1,0 +1,275 @@
+pipeline {
+    agent any
+
+    environment {
+
+        // ==============================
+        // Identity Service
+        // ==============================
+        IDENTITY_IMAGE_NAME = "pcts2/identityservice"
+        IDENTITY_ARTIFACT_NAME = "identityservice-${BUILD_NUMBER}.tar"
+
+        // ==============================
+        // Master Service
+        // ==============================
+        MASTER_IMAGE_NAME = "pcts2/master"
+        MASTER_ARTIFACT_NAME = "master-${BUILD_NUMBER}.tar"
+
+        // ==============================
+        // DHS Service
+        // ==============================
+        DHS_IMAGE_NAME = "pcts2/dhs"
+        DHS_ARTIFACT_NAME = "dhs-${BUILD_NUMBER}.tar"
+
+        // ==============================
+        // Application Server
+        // ==============================
+        APP_SERVER = "root@202.66.173.124"
+        DEPLOY_DIR = "/root/deployments"
+        DEPLOY_SCRIPT = "/root/deploy-backend-sa.sh"
+
+        // ==============================
+        // Git
+        // ==============================
+        GIT_REPO = "https://github.com/jia-platforms/PCTS2.0-Backend.git"
+        GIT_BRANCH = "staging"
+    }
+
+    stages {
+
+        // ==============================
+        // Checkout
+        // ==============================
+        stage('Checkout') {
+            steps {
+                git(
+                    branch: "${GIT_BRANCH}",
+                    credentialsId: 'github-pcts-backend',
+                    url: "${GIT_REPO}"
+                )
+            }
+        }
+
+        // ==============================
+        // Build Identity Image
+        // ==============================
+        stage('Build Identity Image') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Building Identity Docker Image"
+
+                    docker build \
+                        -t ${IDENTITY_IMAGE_NAME}:${BUILD_NUMBER} \
+                        -f src/Services/Identity/Dockerfile .
+
+                    docker image inspect \
+                        ${IDENTITY_IMAGE_NAME}:${BUILD_NUMBER} >/dev/null
+                '''
+            }
+        }
+
+        // ==============================
+        // Build Master Image
+        // ==============================
+        stage('Build Master Image') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Building Master Docker Image"
+
+                    docker build \
+                        -t ${MASTER_IMAGE_NAME}:${BUILD_NUMBER} \
+                        -f src/Services/Master/Dockerfile .
+
+                    docker image inspect \
+                        ${MASTER_IMAGE_NAME}:${BUILD_NUMBER} >/dev/null
+                '''
+            }
+        }
+
+        // ==============================
+        // Build DHS Image
+        // ==============================
+        stage('Build DHS Image') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Building DHS Docker Image"
+
+                    docker build \
+                        -t ${DHS_IMAGE_NAME}:${BUILD_NUMBER} \
+                        -f src/Services/DHS/Dockerfile .
+
+                    docker image inspect \
+                        ${DHS_IMAGE_NAME}:${BUILD_NUMBER} >/dev/null
+                '''
+            }
+        }
+
+        // ==============================
+        // Create Identity Artifact
+        // ==============================
+        stage('Create Identity Artifact') {
+            steps {
+                sh '''
+                    set -e
+
+                    rm -f "${IDENTITY_ARTIFACT_NAME}"
+
+                    docker save \
+                        -o "${IDENTITY_ARTIFACT_NAME}" \
+                        "${IDENTITY_IMAGE_NAME}:${BUILD_NUMBER}"
+
+                    ls -lh "${IDENTITY_ARTIFACT_NAME}"
+                '''
+            }
+        }
+
+        // ==============================
+        // Create Master Artifact
+        // ==============================
+        stage('Create Master Artifact') {
+            steps {
+                sh '''
+                    set -e
+
+                    rm -f "${MASTER_ARTIFACT_NAME}"
+
+                    docker save \
+                        -o "${MASTER_ARTIFACT_NAME}" \
+                        "${MASTER_IMAGE_NAME}:${BUILD_NUMBER}"
+
+                    ls -lh "${MASTER_ARTIFACT_NAME}"
+                '''
+            }
+        }
+
+        // ==============================
+        // Create DHS Artifact
+        // ==============================
+        stage('Create DHS Artifact') {
+            steps {
+                sh '''
+                    set -e
+
+                    rm -f "${DHS_ARTIFACT_NAME}"
+
+                    docker save \
+                        -o "${DHS_ARTIFACT_NAME}" \
+                        "${DHS_IMAGE_NAME}:${BUILD_NUMBER}"
+
+                    ls -lh "${DHS_ARTIFACT_NAME}"
+                '''
+            }
+        }
+
+        // ==============================
+        // Archive All Artifacts
+        // ==============================
+        stage('Archive Artifacts') {
+            steps {
+                archiveArtifacts(
+                    artifacts: 'identityservice-*.tar,master-*.tar,dhs-*.tar',
+                    fingerprint: true
+                )
+            }
+        }
+
+        // ==============================
+        // Deployment Approval
+        // ==============================
+        stage('Approval for Deployment') {
+            steps {
+                input(
+                    message: "Approve deployment of Identity + Master + DHS build ${BUILD_NUMBER}?",
+                    ok: "Approve Deployment"
+                )
+            }
+        }
+
+        // ==============================
+        // Copy All Artifacts
+        // ==============================
+        stage('Copy Artifacts to Application Server') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Copying Identity artifact..."
+                    scp "${IDENTITY_ARTIFACT_NAME}" \
+                        "${APP_SERVER}:${DEPLOY_DIR}/"
+
+                    echo "Copying Master artifact..."
+                    scp "${MASTER_ARTIFACT_NAME}" \
+                        "${APP_SERVER}:${DEPLOY_DIR}/"
+
+                    echo "Copying DHS artifact..."
+                    scp "${DHS_ARTIFACT_NAME}" \
+                        "${APP_SERVER}:${DEPLOY_DIR}/"
+
+                    echo "All three artifacts copied successfully."
+                '''
+            }
+        }
+
+        // ==============================
+        // Deploy Backend
+        // ==============================
+        stage('Deploy Backend') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Deploying Identity + Master + DHS..."
+
+                    ssh "${APP_SERVER}" \
+                        "${DEPLOY_SCRIPT} ${BUILD_NUMBER}"
+                '''
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo "========================================"
+            echo " BACKEND DEPLOYMENT SUCCESSFUL"
+            echo "========================================"
+
+            echo "Build Number      : ${BUILD_NUMBER}"
+
+            echo "Identity Image    : ${IDENTITY_IMAGE_NAME}:${BUILD_NUMBER}"
+            echo "Identity Artifact : ${IDENTITY_ARTIFACT_NAME}"
+
+            echo "Master Image      : ${MASTER_IMAGE_NAME}:${BUILD_NUMBER}"
+            echo "Master Artifact   : ${MASTER_ARTIFACT_NAME}"
+
+            echo "DHS Image         : ${DHS_IMAGE_NAME}:${BUILD_NUMBER}"
+            echo "DHS Artifact      : ${DHS_ARTIFACT_NAME}"
+        }
+
+        failure {
+            echo "========================================"
+            echo " BACKEND DEPLOYMENT FAILED"
+            echo "========================================"
+
+            echo "Build Number: ${BUILD_NUMBER}"
+            echo "Check the failed stage in the Jenkins console log."
+            echo "Manual rollback: /root/rollback-backend.sh <OLD_BUILD_NUMBER>"
+        }
+
+        always {
+            sh '''
+                echo "Cleaning Jenkins workspace Docker artifacts..."
+
+                rm -f identityservice-*.tar || true
+                rm -f master-*.tar || true
+                rm -f dhs-*.tar || true
+            '''
+        }
+    }
+}
