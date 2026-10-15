@@ -1,0 +1,243 @@
+trigger: none   # run manually
+
+pool:
+  name: 'Default'
+
+variables:
+- group: Mobile_dr_sa   # Library variable group holding storePassword and keyPassword
+- name: FLUTTER_VERSION
+  value: '3.41.9'   # must be < 3.44 (IconData became final in 3.44); match the version devs build with
+- name: PUB_CACHE
+  value: '$(Agent.ToolsDirectory)\pub_cache_$(FLUTTER_VERSION)'
+- name: FLUTTER_ROOT_DIR
+  value: '$(Agent.ToolsDirectory)\flutter_$(FLUTTER_VERSION)'
+- name: FLUTTER_DIR
+  value: '$(Agent.ToolsDirectory)\flutter_$(FLUTTER_VERSION)\flutter'
+- name: FLUTTER
+  value: '$(Agent.ToolsDirectory)\flutter_$(FLUTTER_VERSION)\flutter\bin\flutter.bat'
+- name: FLAVOR
+  value: 'servertest'
+- name: APP_DIR
+  value: 'MobileApp/health_worker'
+- name: GIT_BRANCH
+  value: 'Mobile_dr_sa'
+- name: ANDROID_SDK
+  value: 'C:\Android\SDK'
+- name: JDK17
+  value: '$(Agent.ToolsDirectory)\jdk17'
+
+steps:
+- checkout: none
+
+- powershell: |
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+      $found = $false
+      foreach ($c in @("C:\Program Files\Git\cmd", "C:\Program Files (x86)\Git\cmd", "$env:LOCALAPPDATA\Programs\Git\cmd")) {
+        if (Test-Path "$c\git.exe") {
+          $env:PATH = "$c;$env:PATH"
+          Write-Host "##vso[task.prependpath]$c"
+          $found = $true
+          break
+        }
+      }
+      if (-not $found) {
+        $gitDir = Join-Path "$(Agent.ToolsDirectory)" "mingit"
+        if (-not (Test-Path "$gitDir\cmd\git.exe")) {
+          Write-Host "Git not found. Downloading portable MinGit..."
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $zip = Join-Path $env:AGENT_TEMPDIRECTORY "mingit.zip"
+          Invoke-WebRequest "https://github.com/git-for-windows/git/releases/download/v2.45.2.windows.1/MinGit-2.45.2-64-bit.zip" -OutFile $zip
+          New-Item -ItemType Directory -Force -Path $gitDir | Out-Null
+          Expand-Archive $zip -DestinationPath $gitDir -Force
+          Remove-Item $zip
+        }
+        $env:PATH = "$gitDir\cmd;$env:PATH"
+        Write-Host "##vso[task.prependpath]$gitDir\cmd"
+      }
+    }
+    git --version
+
+    $dest = "$(Build.SourcesDirectory)"
+    $empty = Join-Path $env:AGENT_TEMPDIRECTORY "empty_dir"
+    New-Item -ItemType Directory -Force -Path $empty | Out-Null
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+    robocopy $empty $dest /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { Write-Error "Cleanup failed ($LASTEXITCODE)"; exit 1 }
+
+    git -c http.extraheader="AUTHORIZATION: bearer $env:SYSTEM_ACCESSTOKEN" clone --depth 1 --branch $(GIT_BRANCH) https://wau-tfs1.tgi.local/tfs/TGI/SHv3/_git/mobile_dev $dest
+    if ($LASTEXITCODE -ne 0) { exit 1 }
+  displayName: 'Clone mobile_dev ($(GIT_BRANCH))'
+  workingDirectory: $(Agent.TempDirectory)
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+- powershell: |
+    $ProgressPreference = 'SilentlyContinue'
+    $dir = "$(FLUTTER_DIR)"
+    if (-not (Test-Path "$dir\bin\flutter.bat")) {
+      $zip = Join-Path $env:AGENT_TEMPDIRECTORY "flutter_$(FLUTTER_VERSION).zip"
+      Write-Host "Downloading Flutter $(FLUTTER_VERSION)..."
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      Invoke-WebRequest "https://storage.googleapis.com/flutter_infra_release/releases/stable/windows/flutter_windows_$(FLUTTER_VERSION)-stable.zip" -OutFile $zip
+      New-Item -ItemType Directory -Force -Path "$(FLUTTER_ROOT_DIR)" | Out-Null
+      Expand-Archive $zip -DestinationPath "$(FLUTTER_ROOT_DIR)" -Force
+      Remove-Item $zip
+    } else {
+      Write-Host "Flutter $(FLUTTER_VERSION) already installed"
+    }
+    git config --global --add safe.directory '*'
+    & "$dir\bin\flutter.bat" config --android-sdk "$(ANDROID_SDK)" --no-analytics
+    & "$dir\bin\flutter.bat" --version
+  displayName: 'Install Flutter $(FLUTTER_VERSION)'
+
+- powershell: |
+    $ProgressPreference = 'SilentlyContinue'
+    $jdkRoot = "$(JDK17)"
+    if (-not (Test-Path "$jdkRoot\bin\java.exe")) {
+      Write-Host "Downloading Temurin JDK 17..."
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      $zip = Join-Path $env:AGENT_TEMPDIRECTORY "jdk17.zip"
+      $tmp = Join-Path $env:AGENT_TEMPDIRECTORY "jdk17_extract"
+      Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile $zip
+      Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+      Expand-Archive $zip -DestinationPath $tmp -Force
+      Remove-Item $zip
+      New-Item -ItemType Directory -Force -Path $jdkRoot | Out-Null
+      $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
+      Copy-Item "$($inner.FullName)\*" $jdkRoot -Recurse -Force
+      Remove-Item $tmp -Recurse -Force
+    } else {
+      Write-Host "JDK 17 already installed"
+    }
+    & "$jdkRoot\bin\java.exe" -version
+  displayName: 'Install JDK 17'
+
+- powershell: |
+    $sp = $env:STORE_PASS.Replace('\', '\\')
+    $kp = $env:KEY_PASS.Replace('\', '\\')
+    @"
+    storePassword=$sp
+    keyPassword=$kp
+    keyAlias=upload
+    storeFile=../app/upload-keystore.jks
+    "@ | Set-Content "$(Build.SourcesDirectory)\$(APP_DIR)\android\key.properties"
+  displayName: 'Create key.properties'
+  env:
+    STORE_PASS: $(storePassword)
+    KEY_PASS: $(keyPassword)
+
+- powershell: |
+    # pubspec.lock is kept on purpose so CI resolves the same package versions as the developers
+    Remove-Item "$(Build.SourcesDirectory)\$(APP_DIR)\.flutter-plugins" -Force -ErrorAction SilentlyContinue
+    Remove-Item "$(Build.SourcesDirectory)\$(APP_DIR)\.flutter-plugins-dependencies" -Force -ErrorAction SilentlyContinue
+    Write-Host "Removed stale .flutter-plugins files"
+  displayName: 'Remove stale plugin files'
+
+- powershell: |
+    if (Test-Path "$(PUB_CACHE)") {
+      Remove-Item "$(PUB_CACHE)" -Recurse -Force -ErrorAction SilentlyContinue
+      Write-Host "Deleted pub cache $(PUB_CACHE)"
+    } else {
+      Write-Host "No pub cache to delete"
+    }
+  displayName: 'Delete pub cache'
+
+- script: '"$(FLUTTER)" clean'
+  workingDirectory: $(APP_DIR)
+  displayName: 'flutter clean'
+
+- script: '"$(FLUTTER)" pub get'
+  workingDirectory: $(APP_DIR)
+  displayName: 'flutter pub get'
+
+- powershell: |
+    $app = "$(Build.SourcesDirectory)\$(APP_DIR)"
+    $tracker = "$(Build.SourcesDirectory)\MobileApp\health_tracker"
+
+    # 1. compileSdkVersion -> 35
+    $f = "$app\android\app\build.gradle"
+    (Get-Content $f) -replace 'compileSdkVersion\s+\d+', 'compileSdkVersion 35' | Set-Content $f
+
+    # 2. silence AGP warning for compileSdk 35
+    Add-Content "$app\android\gradle.properties" "`nandroid.suppressUnsupportedCompileSdk=35"
+
+    # 3. add JitPack to allprojects repositories
+    $f = "$app\android\build.gradle"
+    $c = Get-Content $f -Raw
+    if ($c -notmatch 'jitpack') {
+      $c = $c -replace '(allprojects\s*\{\s*repositories\s*\{)', "`$1`n        maven { url 'https://jitpack.io' }"
+      Set-Content $f $c
+    }
+
+    # 4. LiquidCore as @aar
+    Get-ChildItem "$tracker\android" -Recurse -Include *.gradle | ForEach-Object {
+      $t = Get-Content $_.FullName -Raw
+      if ($t -match 'LiquidCore:0\.5\.1' -and $t -notmatch 'LiquidCore:0\.5\.1@aar') {
+        $t = $t -replace "LiquidCore:0\.5\.1'", "LiquidCore:0.5.1@aar'"
+        $t = $t -replace 'LiquidCore:0\.5\.1"', 'LiquidCore:0.5.1@aar"'
+        Set-Content $_.FullName $t
+        Write-Host "Patched LiquidCore in $($_.FullName)"
+      }
+    }
+
+    Write-Host "=== result ==="
+    Select-String -Path "$app\android\app\build.gradle" -Pattern "compileSdk"
+    Select-String -Path "$app\android\build.gradle" -Pattern "jitpack"
+    Get-ChildItem "$tracker\android" -Recurse -Include *.gradle | Select-String "LiquidCore"
+  displayName: 'Patch Gradle files'
+
+- powershell: |
+    $ProgressPreference = 'SilentlyContinue'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    foreach ($ext in @("pom","jar","aar")) {
+      Write-Host "=== LiquidCore 0.5.1 .$ext ==="
+      try {
+        $r = Invoke-WebRequest "https://jitpack.io/com/github/LiquidPlayer/LiquidCore/0.5.1/LiquidCore-0.5.1.$ext" -Method Head -UseBasicParsing -TimeoutSec 60
+        Write-Host "HTTP $($r.StatusCode)"
+      } catch {
+        Write-Host "FAILED: $($_.Exception.Message)"
+      }
+    }
+  displayName: 'Test JitPack access'
+  continueOnError: true
+
+- task: CmdLine@2
+  displayName: 'Check JitPack access'
+  continueOnError: true
+  inputs:
+    script: |
+      curl -I https://jitpack.io/com/github/LiquidPlayer/LiquidCore/0.5.1/LiquidCore-0.5.1.aar
+
+- powershell: |
+    $ks = "$(Build.SourcesDirectory)\$(APP_DIR)\android\app\upload-keystore.jks"
+    Write-Host "Keystore exists: $(Test-Path $ks)"
+    Write-Host "Keystore size (bytes): $((Get-Item $ks).Length)"
+    Write-Host "Keystore SHA256: $((Get-FileHash $ks -Algorithm SHA256).Hash)"
+    Write-Host "storePassword length: $($env:STORE_PASS.Length), keyPassword length: $($env:KEY_PASS.Length)"
+    if ($env:STORE_PASS -like '$(*') { Write-Host "##[warning]storePassword is NOT defined (variable group not linked?)" }
+    & "$(JDK17)\bin\keytool.exe" -list -keystore $ks -storepass "$env:STORE_PASS"
+  displayName: 'Diagnose keystore'
+  continueOnError: true
+  env:
+    STORE_PASS: $(storePassword)
+    KEY_PASS: $(keyPassword)
+
+- script: '"$(FLUTTER)" build apk --flavor $(FLAVOR) --no-tree-shake-icons'
+  workingDirectory: $(APP_DIR)
+  displayName: 'Build APK'
+  env:
+    JAVA_HOME: '$(JDK17)'
+    ANDROID_HOME: '$(ANDROID_SDK)'
+    ANDROID_SDK_ROOT: '$(ANDROID_SDK)'
+
+- task: CopyFiles@2
+  inputs:
+    sourceFolder: '$(Build.SourcesDirectory)/$(APP_DIR)/build/app/outputs'
+    contents: '**/*.apk'
+    targetFolder: '$(Build.ArtifactStagingDirectory)'
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    pathToPublish: '$(Build.ArtifactStagingDirectory)'
+    artifactName: 'apk'
