@@ -1,0 +1,171 @@
+root@applictionvm2:~/backend/PCTS2.0-Backend/docker# cat nginx-backend.conf
+# Docker internal DNS: re-resolve container IPs when they change
+resolver 127.0.0.11 valid=10s ipv6=off;
+
+server {
+    listen 8080;
+    server_name _;
+
+    client_max_body_size 100M;
+
+    # ---------- Upstreams (variables force runtime DNS resolution) ----------
+    set $identity_up   identityservice:8080;
+    set $master_up     master:8080;
+    set $dhs_up        dhs:8080;
+    set $medical_up    medical:8080;
+    set $janaadhaar_up janaadhaar:8080;
+
+    # Empty by default -> header is not sent. Prefix locations override it.
+    set $fwd_prefix "";
+
+    # ---------- Common proxy settings (inherited by all locations) ----------
+    proxy_http_version 1.1;
+    proxy_set_header Host               $host;
+    proxy_set_header X-Real-IP          $remote_addr;
+    proxy_set_header X-Forwarded-For    $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto  $scheme;
+    proxy_set_header X-Forwarded-Prefix $fwd_prefix;
+
+    proxy_connect_timeout 60s;
+    proxy_send_timeout    60s;
+    proxy_read_timeout    60s;
+
+    # ==========================================================
+    # GATEWAY
+    # ==========================================================
+    location = / {
+        default_type text/plain;
+        return 200 "PCTS Backend Gateway OK\n";
+    }
+
+    location = /health {
+        default_type text/plain;
+        return 200 "PCTS Backend Gateway OK\n";
+    }
+
+    # ==========================================================
+    # DHS
+    # ==========================================================
+    location = /dhs { return 301 /dhs/; }
+
+    location = /dhs/ {
+        rewrite ^ /health/live break;
+        proxy_pass http://$dhs_up;
+    }
+
+    location ^~ /dhs/ {
+        set $fwd_prefix /dhs;
+        rewrite ^/dhs/(.*)$ /$1 break;
+        proxy_pass http://$dhs_up;
+    }
+
+    # ==========================================================
+    # IDENTITY
+    # ==========================================================
+    location = /identity { return 301 /identity/; }
+
+    location = /identity/ {
+        rewrite ^ /health/live break;
+        proxy_pass http://$identity_up;
+    }
+
+    location ^~ /identity/ {
+        set $fwd_prefix /identity;
+        rewrite ^/identity/(.*)$ /$1 break;
+        proxy_pass http://$identity_up;
+    }
+
+    # ==========================================================
+    # MASTER
+    # ==========================================================
+    location = /master { return 301 /master/; }
+
+    location = /master/ {
+        rewrite ^ /health/live break;
+        proxy_pass http://$master_up;
+    }
+
+    location ^~ /master/ {
+        set $fwd_prefix /master;
+        rewrite ^/master/(.*)$ /$1 break;
+        proxy_pass http://$master_up;
+    }
+
+    # ==========================================================
+    # MEDICAL    /medical/api/<anything> -> medical:8080/api/<anything>
+    # ==========================================================
+    location = /medical { return 301 /medical/; }
+
+    location = /medical/ {
+        rewrite ^ /health/live break;
+        proxy_pass http://$medical_up;
+    }
+
+    location ^~ /medical/ {
+        set $fwd_prefix /medical;
+        rewrite ^/medical/(.*)$ /$1 break;
+        proxy_pass http://$medical_up;
+    }
+
+    # ==========================================================
+    # JANAADHAAR /janaadhaar/api/<anything> -> janaadhaar:8080/api/<anything>
+    # ==========================================================
+    location = /janaadhaar { return 301 /janaadhaar/; }
+
+    location = /janaadhaar/ {
+        rewrite ^ /health/live break;
+        proxy_pass http://$janaadhaar_up;
+    }
+
+    location ^~ /janaadhaar/ {
+        set $fwd_prefix /janaadhaar;
+        rewrite ^/janaadhaar/(.*)$ /$1 break;
+        proxy_pass http://$janaadhaar_up;
+    }
+
+    # ==========================================================
+    # LEGACY (un-prefixed) API ROUTES -> MASTER
+    # Add new Master controllers to this list.
+    # ==========================================================
+    location ~* ^/api/(bankmaster|branchmaster|unitmaster|villageandwardmaster|anganwarimaster|anmmaster|ashamaster)(/|$) {
+        proxy_pass http://$master_up;
+    }
+
+    # ==========================================================
+    # LEGACY (un-prefixed) API ROUTES -> DHS
+    # Add new DHS controllers to this list.
+    # ==========================================================
+    location ~* ^/api/(couplesurvey|janaadhardata|eligiblecouple)(/|$) {
+        proxy_pass http://$dhs_up;
+    }
+
+    # ==========================================================
+    # LEGACY (un-prefixed) API ROUTES -> MEDICAL
+    # Add new Medical controllers to this list.
+    # ==========================================================
+    location ~* ^/api/(j1-registration)(/|$) {
+        proxy_pass http://$medical_up;
+    }
+
+    # ==========================================================
+    # LEGACY (un-prefixed) API ROUTES -> JANAADHAAR
+    # Add new JanAadhaar controllers to this list.
+    # ==========================================================
+    location ~* ^/api/(janaadhaar)(/|$) {
+        proxy_pass http://$janaadhaar_up;
+    }
+
+    # ==========================================================
+    # EVERYTHING ELSE UNDER /api/ -> IDENTITY
+    # ==========================================================
+    location /api/ {
+        proxy_pass http://$identity_up;
+    }
+
+    # ==========================================================
+    # IDENTITY UPLOADED IMAGES
+    # ==========================================================
+    location /images/ {
+        proxy_pass http://$identity_up;
+    }
+}
