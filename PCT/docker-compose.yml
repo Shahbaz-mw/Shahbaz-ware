@@ -1,0 +1,394 @@
+root@applictionvm2:~/backend/PCTS2.0-Backend/docker# cat nginx-backend.conf
+# Docker internal DNS: re-resolve container IPs when they change
+resolver 127.0.0.11 valid=10s ipv6=off;
+
+server {
+    listen 8080;
+    server_name _;
+
+    client_max_body_size 100M;
+
+    # ---------- Upstreams (variables force runtime DNS resolution) ----------
+    set $identity_up   identityservice:8080;
+    set $master_up     master:8080;
+    set $dhs_up        dhs:8080;
+    set $medical_up    medical:8080;
+    set $janaadhaar_up janaadhaar:8080;
+
+    # Empty by default -> header is not sent. Prefix locations override it.
+    set $fwd_prefix "";
+
+    # ---------- Common proxy settings (inherited by all locations) ----------
+    proxy_http_version 1.1;
+    proxy_set_header Host               $host;
+    proxy_set_header X-Real-IP          $remote_addr;
+    proxy_set_header X-Forwarded-For    $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto  $scheme;
+    proxy_set_header X-Forwarded-Prefix $fwd_prefix;
+
+    proxy_connect_timeout 60s;
+    proxy_send_timeout    60s;
+    proxy_read_timeout    60s;
+
+    # ==========================================================
+    # GATEWAY
+    # ==========================================================
+    location = / {
+        default_type text/plain;
+        return 200 "PCTS Backend Gateway OK\n";
+    }
+
+    location = /health {
+        default_type text/plain;
+        return 200 "PCTS Backend Gateway OK\n";
+    }
+
+    # ==========================================================
+    # DHS
+    # ==========================================================
+    location = /dhs { return 301 /dhs/; }
+
+    location = /dhs/ {
+        rewrite ^ /health/live break;
+        proxy_pass http://$dhs_up;
+    }
+
+    location ^~ /dhs/ {
+        set $fwd_prefix /dhs;
+        rewrite ^/dhs/(.*)$ /$1 break;
+        proxy_pass http://$dhs_up;
+    }
+
+    # ==========================================================
+    # IDENTITY
+    # ==========================================================
+    location = /identity { return 301 /identity/; }
+
+    location = /identity/ {
+        rewrite ^ /health/live break;
+        proxy_pass http://$identity_up;
+    }
+
+    location ^~ /identity/ {
+        set $fwd_prefix /identity;
+        rewrite ^/identity/(.*)$ /$1 break;
+        proxy_pass http://$identity_up;
+    }
+
+    # ==========================================================
+    # MASTER
+    # ==========================================================
+    location = /master { return 301 /master/; }
+
+    location = /master/ {
+        rewrite ^ /health/live break;
+        proxy_pass http://$master_up;
+    }
+
+    location ^~ /master/ {
+        set $fwd_prefix /master;
+        rewrite ^/master/(.*)$ /$1 break;
+        proxy_pass http://$master_up;
+    }
+
+    # ==========================================================
+    # MEDICAL    /medical/api/<anything> -> medical:8080/api/<anything>
+    # ==========================================================
+    location = /medical { return 301 /medical/; }
+
+    location = /medical/ {
+        rewrite ^ /health/live break;
+        proxy_pass http://$medical_up;
+    }
+
+    location ^~ /medical/ {
+        set $fwd_prefix /medical;
+        rewrite ^/medical/(.*)$ /$1 break;
+        proxy_pass http://$medical_up;
+    }
+
+    # ==========================================================
+    # JANAADHAAR /janaadhaar/api/<anything> -> janaadhaar:8080/api/<anything>
+    # ==========================================================
+    location = /janaadhaar { return 301 /janaadhaar/; }
+
+    location = /janaadhaar/ {
+        rewrite ^ /health/live break;
+        proxy_pass http://$janaadhaar_up;
+    }
+
+    location ^~ /janaadhaar/ {
+        set $fwd_prefix /janaadhaar;
+        rewrite ^/janaadhaar/(.*)$ /$1 break;
+        proxy_pass http://$janaadhaar_up;
+    }
+
+    # ==========================================================
+    # LEGACY (un-prefixed) API ROUTES -> MASTER
+    # Add new Master controllers to this list.
+    # ==========================================================
+    location ~* ^/api/(bankmaster|branchmaster|unitmaster|villageandwardmaster|anganwarimaster|anmmaster|ashamaster)(/|$) {
+        proxy_pass http://$master_up;
+    }
+
+    # ==========================================================
+    # LEGACY (un-prefixed) API ROUTES -> DHS
+    # Add new DHS controllers to this list.
+    # ==========================================================
+    location ~* ^/api/(couplesurvey|janaadhardata|eligiblecouple)(/|$) {
+        proxy_pass http://$dhs_up;
+    }
+
+    # ==========================================================
+    # LEGACY (un-prefixed) API ROUTES -> MEDICAL
+    # Add new Medical controllers to this list.
+    # ==========================================================
+    location ~* ^/api/(j1-registration)(/|$) {
+        proxy_pass http://$medical_up;
+    }
+
+    # ==========================================================
+    # LEGACY (un-prefixed) API ROUTES -> JANAADHAAR
+    # Add new JanAadhaar controllers to this list.
+    # ==========================================================
+    location ~* ^/api/(janaadhaar)(/|$) {
+        proxy_pass http://$janaadhaar_up;
+    }
+
+    # ==========================================================
+    # EVERYTHING ELSE UNDER /api/ -> IDENTITY
+    # ==========================================================
+    location /api/ {
+        proxy_pass http://$identity_up;
+    }
+
+    # ==========================================================
+    # IDENTITY UPLOADED IMAGES
+    # ==========================================================
+    location /images/ {
+        proxy_pass http://$identity_up;
+    }
+}
+root@applictionvm2:~/backend/PCTS2.0-Backend/docker#
+root@applictionvm2:~/backend/PCTS2.0-Backend/docker#
+root@applictionvm2:~/backend/PCTS2.0-Backend/docker#
+root@applictionvm2:~/backend/PCTS2.0-Backend/docker# cat docker-compose.yml
+services:
+
+  # ==========================================================
+  # IDENTITY SERVICE
+  # ==========================================================
+  identityservice:
+    image: pcts2/identityservice:${IMAGE_TAG:-latest}
+    container_name: pcts-identityservice
+    restart: unless-stopped
+
+    expose:
+      - "8080"
+
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: "http://+:8080"
+
+      ConnectionStrings__PctsLogin: "Server=103.48.51.57,${SQLSERVER_PORT:-1433};Database=PctsLogin;User Id=${SQLSERVER_USER};Password=${SQLSERVER_PASSWORD};TrustServerCertificate=True;"
+
+      Jwt__Key: ${JWT_SIGNING_KEY}
+      Jwt__Issuer: PCTS2.IdentityService
+      Jwt__Audience: PCTS2.Clients
+      Jwt__AccessTokenExpirationMinutes: "15"
+      Jwt__RefreshTokenExpirationDays: "7"
+
+    volumes:
+      - /opt/pcts2/uploads/images:/app/uploads/images
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - pcts-net
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+
+  # ==========================================================
+  # MASTER MICROSERVICE
+  # ==========================================================
+  master:
+    image: pcts2/master:${IMAGE_TAG:-latest}
+    container_name: pcts-master
+    restart: unless-stopped
+
+    expose:
+      - "8080"
+
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: "http://+:8080"
+
+      ConnectionStrings__PctsMaster: "Server=103.48.51.57,${SQLSERVER_PORT:-1433};Database=PctsMaster;User Id=${SQLSERVER_USER};Password=${SQLSERVER_PASSWORD};TrustServerCertificate=True;"
+
+      Jwt__Key: ${JWT_SIGNING_KEY}
+      Jwt__Issuer: PCTS2.IdentityService
+      Jwt__Audience: PCTS2.Clients
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - pcts-net
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+
+  # ==========================================================
+  # DHS MICROSERVICE
+  # ==========================================================
+  dhs:
+    image: pcts2/dhs:${IMAGE_TAG:-latest}
+    container_name: pcts-dhs
+    restart: unless-stopped
+
+    expose:
+      - "8080"
+
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: "http://+:8080"
+
+      ConnectionStrings__Dhs: "Server=103.48.51.57,${SQLSERVER_PORT:-1433};Database=PctsMedical;User Id=${SQLSERVER_USER};Password=${SQLSERVER_PASSWORD};TrustServerCertificate=True;"
+
+      Jwt__Key: ${JWT_SIGNING_KEY}
+      Jwt__Issuer: PCTS2.IdentityService
+      Jwt__Audience: PCTS2.Clients
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - pcts-net
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+
+  # ==========================================================
+  # MEDICAL MICROSERVICE
+  # ==========================================================
+  medical:
+    image: pcts2/medical:${IMAGE_TAG:-latest}
+    container_name: pcts-medical
+    restart: unless-stopped
+
+    expose:
+      - "8080"
+
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: "http://+:8080"
+
+      ConnectionStrings__Medical: "Server=103.48.51.57,${SQLSERVER_PORT:-1433};Database=PctsMedical;User Id=${SQLSERVER_USER};Password=${SQLSERVER_PASSWORD};TrustServerCertificate=True;"
+
+      Jwt__Key: ${JWT_SIGNING_KEY}
+      Jwt__Issuer: PCTS2.IdentityService
+      Jwt__Audience: PCTS2.Clients
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - pcts-net
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+
+  # ==========================================================
+  # JANAADHAAR MICROSERVICE
+  # ==========================================================
+  janaadhaar:
+    image: pcts2/janaadhaar:${IMAGE_TAG:-latest}
+    container_name: pcts-janaadhaar
+    restart: unless-stopped
+
+    expose:
+      - "8080"
+
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: "http://+:8080"
+
+      ConnectionStrings__PctsJanAadhaar: "Server=103.48.51.57,${SQLSERVER_PORT:-1433};Database=PctsMedical;User Id=${SQLSERVER_USER};Password=${SQLSERVER_PASSWORD};TrustServerCertificate=True;"
+
+      JwtSettings__SecretKey: ${JWT_SIGNING_KEY}
+      JwtSettings__Issuer: PCTS2.IdentityService
+      JwtSettings__Audience: PCTS2.Clients
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - pcts-net
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+
+  # ==========================================================
+  # NGINX BACKEND GATEWAY
+  # ==========================================================
+  backend-gateway:
+    image: nginx:alpine
+    container_name: pcts-backend-gateway
+    restart: unless-stopped
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      - ./nginx-backend.conf:/etc/nginx/conf.d/default.conf:ro
+
+    depends_on:
+      identityservice:
+        condition: service_healthy
+      master:
+        condition: service_healthy
+      dhs:
+        condition: service_healthy
+      medical:
+        condition: service_healthy
+      janaadhaar:
+        condition: service_healthy
+
+    networks:
+      - pcts-net
+
+
+# ==========================================================
+# NETWORK
+# ==========================================================
+networks:
+  pcts-net:
+    name: docker_pcts-net
+    driver: bridge
