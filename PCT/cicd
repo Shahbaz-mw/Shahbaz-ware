@@ -310,12 +310,13 @@ pipeline {
         stage('Deploy Backend') {
             steps {
                 sh '''
-                    set -e
+                    set -xve
 
                     echo "Deploying all five backend microservices..."
 
                     ssh "${APP_SERVER}" \
                         "${DEPLOY_SCRIPT} ${BUILD_NUMBER}"
+
                 '''
             }
         }
