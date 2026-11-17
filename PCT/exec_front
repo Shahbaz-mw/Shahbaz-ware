@@ -1,0 +1,288 @@
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME    = "pcts2/frontend"
+        IMAGE_TAG     = "${BUILD_NUMBER}"
+        ARTIFACT_NAME = "frontend-${BUILD_NUMBER}.tar"
+
+        SERVER     = "202.66.173.124"
+        DEPLOY_DIR = "/root/deployments/frontend"
+
+        CONTAINER_NAME = "pcts-frontend"
+
+        GIT_REPO   = "https://github.com/jia-platforms/PCTS2.0-Frontend.git"
+        GIT_BRANCH = "development"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                deleteDir()
+
+                git(
+                    branch: "${GIT_BRANCH}",
+                    credentialsId: 'github-backend',
+                    url: "${GIT_REPO}"
+                )
+            }
+        }
+
+        stage('Verify Files') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Current directory:"
+                    pwd
+
+                    echo ""
+                    echo "Repository files:"
+                    ls -la
+
+                    echo ""
+                    echo "Checking Dockerfile..."
+                    test -f Dockerfile
+
+                    echo "Dockerfile found."
+                '''
+            }
+        }
+
+        stage('Build Image') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Building frontend Docker image..."
+
+                    docker build \
+                        -f Dockerfile \
+                        -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                        .
+
+                    echo ""
+                    echo "Image created:"
+                    docker images ${IMAGE_NAME}
+                '''
+            }
+        }
+
+        stage('Create Artifact') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Creating Docker artifact..."
+
+                    rm -f ${ARTIFACT_NAME}
+
+                    docker save \
+                        -o ${ARTIFACT_NAME} \
+                        ${IMAGE_NAME}:${IMAGE_TAG}
+
+                    ls -lh ${ARTIFACT_NAME}
+                '''
+            }
+        }
+
+        stage('Archive') {
+            steps {
+                archiveArtifacts(
+                    artifacts: "${ARTIFACT_NAME}",
+                    fingerprint: true
+                )
+            }
+        }
+
+        stage('Copy to VM2') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'server-ssh-creds',
+                        usernameVariable: 'SSH_USER',
+                        passwordVariable: 'SSH_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        echo "Creating deployment directory..."
+
+                        sshpass -p "$SSH_PASSWORD" ssh \
+                            -o StrictHostKeyChecking=no \
+                            "$SSH_USER@$SERVER" \
+                            "mkdir -p ${DEPLOY_DIR}"
+
+                        echo "Copying frontend artifact..."
+
+                        sshpass -p "$SSH_PASSWORD" scp \
+                            -o StrictHostKeyChecking=no \
+                            "${ARTIFACT_NAME}" \
+                            "$SSH_USER@$SERVER:${DEPLOY_DIR}/"
+
+                        echo "Artifact copied successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Artifact') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'server-ssh-creds',
+                        usernameVariable: 'SSH_USER',
+                        passwordVariable: 'SSH_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        echo "Verifying artifact on VM2..."
+
+                        sshpass -p "$SSH_PASSWORD" ssh \
+                            -o StrictHostKeyChecking=no \
+                            "$SSH_USER@$SERVER" \
+                            "ls -lh ${DEPLOY_DIR}/${ARTIFACT_NAME}"
+
+                        echo "Artifact verified successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Approval for Deployment') {
+            steps {
+                input(
+                    message: "Approve deployment of Frontend build ${BUILD_NUMBER} to Production?",
+                    ok: "Approve Deployment"
+                )
+            }
+        }
+
+        stage('Deploy Frontend') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'server-ssh-creds',
+                        usernameVariable: 'SSH_USER',
+                        passwordVariable: 'SSH_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        echo "Starting frontend deployment..."
+
+                        sshpass -p "$SSH_PASSWORD" ssh \
+                            -o StrictHostKeyChecking=no \
+                            "$SSH_USER@$SERVER" \
+                            "docker load -i ${DEPLOY_DIR}/${ARTIFACT_NAME}"
+
+                        echo ""
+                        echo "Image loaded successfully."
+
+                        sshpass -p "$SSH_PASSWORD" ssh \
+                            -o StrictHostKeyChecking=no \
+                            "$SSH_USER@$SERVER" << EOF
+
+set -e
+
+echo "=========================================="
+echo "Loaded image"
+echo "=========================================="
+
+docker images ${IMAGE_NAME}
+
+echo ""
+echo "=========================================="
+echo "Stopping old frontend container"
+echo "=========================================="
+
+docker stop ${CONTAINER_NAME} || true
+
+echo ""
+echo "=========================================="
+echo "Removing old frontend container"
+echo "=========================================="
+
+docker rm ${CONTAINER_NAME} || true
+
+echo ""
+echo "=========================================="
+echo "Starting frontend ${IMAGE_TAG}"
+echo "=========================================="
+
+docker run -d \
+    --name ${CONTAINER_NAME} \
+    -p 80:80 \
+    --restart unless-stopped \
+    ${IMAGE_NAME}:${IMAGE_TAG}
+
+echo ""
+echo "=========================================="
+echo "Waiting for frontend"
+echo "=========================================="
+
+sleep 5
+
+echo ""
+echo "=========================================="
+echo "Container status"
+echo "=========================================="
+
+docker ps \
+    --filter "name=${CONTAINER_NAME}"
+
+echo ""
+echo "=========================================="
+echo "Testing frontend"
+echo "=========================================="
+
+curl -f http://localhost/
+
+echo ""
+echo "Frontend root test successful."
+
+echo ""
+echo "Testing Angular login route"
+echo "=========================================="
+
+curl -f http://localhost/login
+
+echo ""
+echo "Login route test successful."
+
+echo ""
+echo "=========================================="
+echo "Frontend deployment successful"
+echo "Image: ${IMAGE_NAME}:${IMAGE_TAG}"
+echo "Container: ${CONTAINER_NAME}"
+echo "=========================================="
+
+EOF
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo "Frontend CI/CD deployment successful."
+            echo "Image: ${IMAGE_NAME}:${IMAGE_TAG}"
+            echo "Artifact: ${ARTIFACT_NAME}"
+        }
+
+        failure {
+            echo "Frontend CI/CD deployment failed."
+        }
+
+        always {
+            sh 'rm -f frontend-*.tar || true'
+        }
+    }
+}
